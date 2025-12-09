@@ -293,7 +293,10 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
             q_rope_1 = __half2float(local_qkv[tid - ROTARY_DIM / 2]);
             k_rope_1 = __half2float(local_qkv[HEAD_DIM + tid - ROTARY_DIM / 2]);
         }
-        block.sync();
+    }
+    block.sync();  // CRITICAL: sync must be outside conditional for all threads
+    
+    if (tid < ROTARY_DIM) {
         if (tid < ROTARY_DIM / 2) {
             local_qkv[tid] = __float2half(q_rope * cos_reg - q_rope_1 * sin_reg);
             local_qkv[HEAD_DIM + tid] = __float2half(k_rope * cos_reg - k_rope_1 * sin_reg);

@@ -24,10 +24,23 @@ else:
     test_run = 10000
 
 def initialize_rope_embeddings(rotary_dim):
-    """Initialize RoPE embeddings for only rotary_dim dimensions"""
+    """
+    Initialize RoPE embeddings for only rotary_dim dimensions.
+    Note: Kernel expects HEAD_DIM size, so we pad with zeros for non-rotary dims.
+    """
     angles = (torch.rand((1, rotary_dim), dtype=torch.float32) * (2 * torch.pi)).to(0)
     h_cos = torch.cos(angles)
     h_sin = torch.sin(angles)
+    
+    # Pad to HEAD_DIM size (kernel expects this)
+    # Non-rotary dimensions will have cos=1, sin=0 (identity transform)
+    padding_size = head_dim - rotary_dim
+    cos_padding = torch.ones((1, padding_size), dtype=torch.float32).to(0)
+    sin_padding = torch.zeros((1, padding_size), dtype=torch.float32).to(0)
+    
+    h_cos = torch.cat([h_cos, cos_padding], dim=-1)
+    h_sin = torch.cat([h_sin, sin_padding], dim=-1)
+    
     return h_cos, h_sin
 
 def apply_neox_style_rotary_pos_emb_partial(q, k, cos, sin, rotary_dim):

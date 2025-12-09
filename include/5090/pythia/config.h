@@ -60,11 +60,14 @@
 #define NUM_ROW_PER_WARP_2 (TMA_LOAD_ONCE_ATTN / NUM_WARPS)  // 32 / 4 = 8
 
 // DIM_BLOCK_REDUCE: Dimension for block-level reduction
-#define DIM_BLOCK_REDUCE (2 * BLOCK_SIZE / NUM_THREAD_PER_ROW_2)  // 2 * 128 / 10 = 25
+// Must be >= NUM_WARPS for proper reduction, rounded up
+// Original formula may produce odd numbers causing sync issues
+#define DIM_BLOCK_REDUCE ((2 * BLOCK_SIZE + NUM_THREAD_PER_ROW_2 - 1) / NUM_THREAD_PER_ROW_2)  // ceil(2*128/10) = 26
 
 // DEC_TILE: Decoding tile size
 // This needs careful adjustment for HEAD_DIM=80
-#define DEC_TILE (NUM_ROW_PER_WARP_2 / (WARP_SIZE / NUM_THREAD_PER_ROW_2))  // 8 / (32/10) = 8/3 = 2
+// Using floor division: 8 / 3 = 2, but need to ensure it's at least 1
+#define DEC_TILE ((NUM_ROW_PER_WARP_2 * NUM_THREAD_PER_ROW_2 + WARP_SIZE - 1) / WARP_SIZE)  // ceil(8*10/32) = 3
 
 // Additional computation constants
 #define NUM_ROW_PER_WARP_3 (TMA_LOAD_ONCE / NUM_WARPS)  // 64 / 4 = 16
