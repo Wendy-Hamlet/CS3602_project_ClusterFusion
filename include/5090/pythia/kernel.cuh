@@ -139,6 +139,17 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         *(uint4*)(&input_shmem[d]) = *(uint4*)(&reg_input[0]);
     }
     block.sync();
+    
+    // DEBUG: Print normalized values (first 80 dimensions)
+    if (head_id == 0 && cluster_block_id == 0 && tid == 0) {
+        printf("----------------------------- kernel begin -----------------------------\n");
+        printf("normed kernel: ");
+        for (int i = 0; i < 80; i++) {
+            printf("%.4f ", __half2float(input_shmem[i]));
+        }
+        printf("\n");
+    }
+    cluster.sync();
 
     // Compute input @ w_q
     // Preload weight_q
@@ -277,6 +288,30 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         src_addr, dst_addr, bar_ptr, 
         neighbor_dst_bar, local_qkv, weight);
 
+    // DEBUG: Print Q/K before RoPE (head_id == 1 only)
+    if (head_id == 1 && cluster_block_id == 0 && tid == 0) {
+        printf("before RoPE\n");
+        printf("q, head_id = 1: first 8, last 8\n");
+        for (int i = 0; i < 8; i++) {
+            printf("%.4f ", __half2float(local_qkv[i]));
+        }
+        printf("\n");
+        for (int i = 72; i < 80; i++) {
+            printf("%.4f ", __half2float(local_qkv[i]));
+        }
+        printf("\n");
+        printf("k_new, head_id = 1: first 8, last 8\n");
+        for (int i = 0; i < 8; i++) {
+            printf("%.4f ", __half2float(local_qkv[HEAD_DIM + i]));
+        }
+        printf("\n");
+        for (int i = 72; i < 80; i++) {
+            printf("%.4f ", __half2float(local_qkv[HEAD_DIM + i]));
+        }
+        printf("\n");
+    }
+    cluster.sync();
+    
     // Apply RoPE - Pythia uses rotary_pct=0.25, so only first ROTARY_DIM (20) dimensions get RoPE
     // For dimensions beyond ROTARY_DIM, we keep them unchanged
     if (tid < ROTARY_DIM) {
@@ -306,6 +341,30 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         }
     }
     // Dimensions from ROTARY_DIM to HEAD_DIM remain unchanged
+    
+    // DEBUG: Print Q/K after RoPE (head_id == 1 only)
+    block.sync();
+    if (head_id == 1 && cluster_block_id == 0 && tid == 0) {
+        printf("after RoPE\n");
+        printf("q, head_id = 1: first 8, last 8\n");
+        for (int i = 0; i < 8; i++) {
+            printf("%.4f ", __half2float(local_qkv[i]));
+        }
+        printf("\n");
+        for (int i = 72; i < 80; i++) {
+            printf("%.4f ", __half2float(local_qkv[i]));
+        }
+        printf("\n");
+        printf("k_new, head_id = 1: first 8, last 8\n");
+        for (int i = 0; i < 8; i++) {
+            printf("%.4f ", __half2float(local_qkv[HEAD_DIM + i]));
+        }
+        printf("\n");
+        for (int i = 72; i < 80; i++) {
+            printf("%.4f ", __half2float(local_qkv[HEAD_DIM + i]));
+        }
+        printf("\n");
+    }
 
     // Output kv
     cluster.sync();
@@ -559,6 +618,17 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         size, tid, HEAD_DIM, cluster_block_id,  
         src_addr, dst_addr, bar_ptr, 
         neighbor_dst_bar, &local_qkv[2 * HEAD_DIM], weight);
+    
+    // DEBUG: Print attention output (head_id == 1 only)
+    if (head_id == 1 && cluster_block_id == 0 && tid == 0) {
+        printf("attn output O\n");
+        printf("o, head_id = 1, o\n");
+        for (int i = 0; i < 80; i++) {
+            printf("%.4e ", __half2float(local_qkv[2 * HEAD_DIM + i]));
+        }
+        printf("\n");
+    }
+    cluster.sync();
 
     // Compute output @ w_o
     // Preload w_o
@@ -609,5 +679,20 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     }
     if (lane_id % NUM_THREAD_PER_ROW_3 == 0) {
         atomicAdd(&output[cluster_block_st_id + weight_idx_3 + ((DIM_PER_BLOCK / TMA_LOAD_ONCE) - 1) * TMA_LOAD_ONCE], __float2half(tmp));
+    }
+    
+    // DEBUG: Print final output (first and last 8 values)
+    cluster.sync();
+    if (head_id == 0 && cluster_block_id == 0 && tid == 0) {
+        printf("final output o\n");
+        for (int i = 0; i < 8; i++) {
+            printf("%.4f ", __half2float(output[i]));
+        }
+        printf("\n");
+        for (int i = 2552; i < 2560; i++) {
+            printf("%.4f ", __half2float(output[i]));
+        }
+        printf("\n");
+        printf("-----------------------------  kernel end  -----------------------------\n");
     }
 }

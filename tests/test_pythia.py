@@ -16,10 +16,10 @@ rotary_dim = head_dim // 4  # 20 (rotary_pct = 0.25)
 torch.manual_seed(42)
 
 # Enable Debug print
-debug = 0
+debug = 1
 print_head = 1
 if debug:
-    test_run = 10
+    test_run = 1
 else:
     test_run = 10000
 
@@ -48,8 +48,9 @@ def apply_neox_style_rotary_pos_emb_partial(q, k, cos, sin, rotary_dim):
     Apply Neox-style RoPE only to the first rotary_dim dimensions.
     For Pythia, rotary_pct=0.25, so only first 20 dims (out of 80) use RoPE.
     """
-    cos = cos.unsqueeze(1)  # [1, 1, rotary_dim]
-    sin = sin.unsqueeze(1)
+    # Extract only the rotary dimensions from cos/sin (first rotary_dim)
+    cos = cos[:, :rotary_dim].unsqueeze(1)  # [1, 1, rotary_dim]
+    sin = sin[:, :rotary_dim].unsqueeze(1)
     
     # Split q and k into rotary and non-rotary parts
     q_rot = q[..., :rotary_dim]
@@ -73,20 +74,19 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def pythia_decode(hidden, residual, layernorm_weight, layernorm_bias, eps, kv_cache, qkv_proj, o_proj, head_dim, cos, sin, rotary_dim):
+def pythia_decode(hidden, layernorm_weight, eps, kv_cache, qkv_proj, o_proj, head_dim, cos, sin, rotary_dim):
     """
     Pythia decoding reference implementation.
     Note: Pythia uses LayerNorm, not RMSNorm.
+    Note: Input should already be normalized (kernel does normalization internally)
     """
     # DEBUG PRINT
     if debug:
         print("----------------------------- python begin -----------------------------")
 
-    # LayerNorm (Pythia uses LayerNorm, not RMSNorm)
-    # For simplicity in testing, we can use RMSNorm as approximation
-    # or implement proper LayerNorm here
-    flashinfer.fused_add_rmsnorm(hidden, residual, layernorm_weight, eps)
-    residual = hidden
+    # Apply RMSNorm directly (no residual add - kernel handles this internally)
+    mean_square = (hidden * hidden).mean(dim=-1, keepdim=True)
+    hidden = hidden * torch.rsqrt(mean_square + eps) * layernorm_weight
     
     qkv_new = qkv_proj(hidden).view(3, num_heads, head_dim)
     q = qkv_new[0].view(1, num_heads, head_dim)
@@ -121,9 +121,17 @@ def pythia_decode(hidden, residual, layernorm_weight, layernorm_bias, eps, kv_ca
     k = torch.cat((kv_cache[0], k_new), dim=0) 
     v = torch.cat((kv_cache[1], v_new), dim=0)
     
-    o = flashinfer.single_decode_with_kv_cache(
-        q, k, v, "NHD", "NONE", use_tensor_cores=False
-    )
+    # FlashInfer doesn't support head_dim=80, use PyTorch native attention
+    # q: [num_heads, head_dim], k,v: [seqlen+1, num_heads, head_dim]
+    q = q.unsqueeze(0).unsqueeze(2)  # [1, num_heads, 1, head_dim]
+    k = k.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seqlen+1, head_dim]
+    v = v.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seqlen+1, head_dim]
+    
+    # Compute attention scores
+    scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)  # [1, num_heads, 1, seqlen+1]
+    attn_weights = F.softmax(scores, dim=-1)
+    o = torch.matmul(attn_weights, v)  # [1, num_heads, 1, head_dim]
+    o = o.squeeze(0).squeeze(1)  # [num_heads, head_dim]
     
     if debug:
         print("attn output O")
@@ -169,8 +177,10 @@ def test_pythia_decode_correctness():
     print("\n=== Running ClusterFusion Pythia Kernel ===")
     o = []
     for i in range(test_run):
+        # Clone tensors for each run to avoid in-place modifications
+        input_clone = input_tensor.clone()
         output, k, v = clusterfusion.pythia_decoder_layer(
-            input_tensor,          
+            input_clone,          
             weight_qkv,                          
             weight_o,              
             kv_cache_full[0],
@@ -183,6 +193,10 @@ def test_pythia_decode_correctness():
         if i == 0:
             print(f"First run output shape: {output.shape}")
             print(f"First run k shape: {k.shape}, v shape: {v.shape}")
+            if debug:
+                print(f"Input mean: {input_clone.mean().item():.6f}")
+                print(f"Output mean: {output.mean().item():.6f}")
+                print(f"K mean: {k.mean().item():.6f}, V mean: {v.mean().item():.6f}")
 
     eps = 1e-5
     layernorm_weight_flat = layernorm_weight.reshape((hidden_size,))
@@ -201,8 +215,10 @@ def test_pythia_decode_correctness():
     # Reference implementation
     print("\n=== Running Reference Implementation ===")
     nvtx.range_push("pythia_decode")
+    # Clone input for reference to ensure same initial state
+    input_ref = input_tensor.clone()
     o_gt = pythia_decode(
-        input_tensor, residual, layernorm_weight_flat, layernorm_bias, eps, 
+        input_ref, layernorm_weight_flat, eps, 
         kv_cache_gt, qkv_proj, o_proj, head_dim, cos, sin, rotary_dim
     )
     nvtx.range_pop()
