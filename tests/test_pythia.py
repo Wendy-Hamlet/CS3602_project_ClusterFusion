@@ -68,14 +68,16 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def pythia_decode_reference(hidden, ln_weight, ln_bias, eps, kv_cache, 
-                            weight_qkv, bias_qkv, weight_o, 
+def pythia_decode_reference(hidden, ln_weight, ln_bias, post_ln_weight, post_ln_bias, eps, kv_cache, 
+                            weight_qkv, bias_qkv, weight_o, bias_o,
+                            mlp_up_weight, mlp_up_bias, mlp_down_weight, mlp_down_bias,
                             head_dim, cos, sin, rotary_dim):
     """
-    Pythia decoding reference implementation.
+    Pythia decoding reference implementation with parallel residual (MLP).
     - Uses LayerNorm (with bias), not RMSNorm
     - QKV layout is INTERLEAVED: [Q0, K0, V0, Q1, K1, V1, ...]
     - QKV projection has bias
+    - Parallel residual: output = input + attn(ln(input)) + mlp(post_ln(input))
     """
     if debug:
         print("----------------------------- python begin -----------------------------")
@@ -84,6 +86,9 @@ def pythia_decode_reference(hidden, ln_weight, ln_bias, eps, kv_cache,
     mean = hidden.mean(dim=-1, keepdim=True)
     var = hidden.var(dim=-1, keepdim=True, unbiased=False)
     hidden_normed = (hidden - mean) / torch.sqrt(var + eps) * ln_weight + ln_bias
+    
+    # Post-attention LayerNorm for MLP (same input, different weights)
+    post_ln_normed = (hidden - mean) / torch.sqrt(var + eps) * post_ln_weight + post_ln_bias
     
     if debug: 
         print("normed ref (first 80):", hidden_normed[..., 0:80])
@@ -137,26 +142,48 @@ def pythia_decode_reference(hidden, ln_weight, ln_bias, eps, kv_cache,
         print(f"o, head_id = {print_head}:")
         print(f"{o[print_head, 0: 80]}")
     
-    # Output projection
-    o = torch.matmul(o.view(1, num_heads * head_dim), weight_o.t())
+    # Attention output projection
+    attn_out = torch.matmul(o.view(1, num_heads * head_dim), weight_o.t()) + bias_o
+    
+    # MLP: up -> gelu -> down
+    mlp_out = pythia_mlp_reference(post_ln_normed, mlp_up_weight, mlp_up_bias, mlp_down_weight, mlp_down_bias)
+    
+    # Parallel residual: output = input + attn_out + mlp_out
+    final_output = hidden + attn_out + mlp_out
     
     if debug:
         print("final output o")
-        print(o[0, 0:8])
-        print(o[0, 2552:2560])
+        print(final_output[0, 0:8])
+        print(final_output[0, 2552:2560])
         print("-----------------------------  python end  -----------------------------")
     
-    return o.detach()
+    return final_output.detach()
 
 def generate_random_weights(shape):
     """Generate random weights scaled appropriately"""
     return (torch.randn(shape) * 0.1).to(0).half()
 
+def gelu_approx(x):
+    """GELU approximation used in kernel"""
+    GELU_CONST = 0.7978845608028654  # sqrt(2/pi)
+    GELU_COEF = 0.044715
+    return x * 0.5 * (1.0 + torch.tanh(GELU_CONST * (x + GELU_COEF * x**3)))
+
+def pythia_mlp_reference(hidden_normed, mlp_up_weight, mlp_up_bias, mlp_down_weight, mlp_down_bias):
+    """Reference MLP implementation using GELU approximation"""
+    # Up projection
+    up = torch.matmul(hidden_normed, mlp_up_weight.t()) + mlp_up_bias  # [1, 10240]
+    # GELU activation
+    up = gelu_approx(up.float()).half()
+    # Down projection
+    down = torch.matmul(up, mlp_down_weight.t()) + mlp_down_bias  # [1, 2560]
+    return down
+
 def test_pythia_decode_correctness():
     """Test Pythia decoder layer correctness against reference implementation"""
-    print(f"Testing Pythia-2.8b decoder layer")
+    print(f"Testing Pythia-2.8b decoder layer with MLP")
     print(f"hidden_size: {hidden_size}, num_heads: {num_heads}, head_dim: {head_dim}")
-    print(f"seqlen: {seqlen}, rotary_dim: {rotary_dim}")
+    print(f"seqlen: {seqlen}, rotary_dim: {rotary_dim}, ffn_dim: {ffn_dim}")
     
     # Generate random weights and inputs
     input_tensor = generate_random_weights((1, hidden_size))
@@ -167,12 +194,21 @@ def test_pythia_decode_correctness():
     
     # Output projection weight and bias: [2560, 2560] and [2560]
     weight_o = generate_random_weights((hidden_size, hidden_size))
-    # To match reference implementation (no bias), set bias_o to zeros
     bias_o = torch.zeros((hidden_size,), device=weight_o.device, dtype=weight_o.dtype)
     
     # LayerNorm weight and bias
     ln_weight = generate_random_weights((1, hidden_size))
     ln_bias = generate_random_weights((1, hidden_size))
+    
+    # Post-attention LayerNorm weight and bias (Pythia parallel residual)
+    post_ln_weight = generate_random_weights((1, hidden_size))
+    post_ln_bias = generate_random_weights((1, hidden_size))
+    
+    # MLP weights
+    mlp_up_weight = generate_random_weights((ffn_dim, hidden_size))
+    mlp_up_bias = generate_random_weights((ffn_dim,))
+    mlp_down_weight = generate_random_weights((hidden_size, ffn_dim))
+    mlp_down_bias = generate_random_weights((hidden_size,))
 
     # KV cache: [2, seqlen, num_heads * head_dim]
     kv_cache_full = generate_random_weights((2, seqlen, num_heads * head_dim))
@@ -197,6 +233,13 @@ def test_pythia_decode_correctness():
             ln_bias,              # LayerNorm bias
             cos,                   
             sin,
+            # MLP weights
+            post_ln_weight,
+            post_ln_bias,
+            mlp_up_weight,
+            mlp_up_bias,
+            mlp_down_weight,
+            mlp_down_bias,
             seqlen                # Current sequence length
         )
         o_ours.append(output)
@@ -209,6 +252,8 @@ def test_pythia_decode_correctness():
     eps = 1e-5
     ln_weight_flat = ln_weight.reshape((hidden_size,))
     ln_bias_flat = ln_bias.reshape((hidden_size,))
+    post_ln_weight_flat = post_ln_weight.reshape((hidden_size,))
+    post_ln_bias_flat = post_ln_bias.reshape((hidden_size,))
 
     # KV cache for reference: [2, seqlen, num_heads, head_dim]
     kv_cache_k = kv_cache_full[0].view(seqlen, num_heads, head_dim)
@@ -217,8 +262,10 @@ def test_pythia_decode_correctness():
     
     input_ref = input_tensor.clone()
     o_ref = pythia_decode_reference(
-        input_ref, ln_weight_flat, ln_bias_flat, eps,
-        kv_cache_ref, weight_qkv, bias_qkv, weight_o,
+        input_ref, ln_weight_flat, ln_bias_flat, 
+        post_ln_weight_flat, post_ln_bias_flat, eps,
+        kv_cache_ref, weight_qkv, bias_qkv, weight_o, bias_o,
+        mlp_up_weight, mlp_up_bias, mlp_down_weight, mlp_down_bias,
         head_dim, cos, sin, rotary_dim
     )
     

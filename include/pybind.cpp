@@ -117,6 +117,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     torch::Tensor layernorm_bias,     // LayerNorm bias
     torch::Tensor cos,
     torch::Tensor sin,
+    // MLP weights
+    torch::Tensor post_ln_weight,
+    torch::Tensor post_ln_bias,
+    torch::Tensor mlp_up_weight,
+    torch::Tensor mlp_up_bias,
+    torch::Tensor mlp_down_weight,
+    torch::Tensor mlp_down_bias,
     int64_t current_seq_len           // Current sequence length
 );
 

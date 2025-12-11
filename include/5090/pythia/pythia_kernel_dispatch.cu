@@ -13,10 +13,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     torch::Tensor layernorm_bias,    // [hidden_dim] = [2560]
     torch::Tensor cos,
     torch::Tensor sin,
-    int64_t current_seq_len        // Current sequence length (before appending new token)
+    // MLP weights
+    torch::Tensor post_ln_weight,    // [hidden_dim]
+    torch::Tensor post_ln_bias,      // [hidden_dim]
+    torch::Tensor mlp_up_weight,     // [ffn_dim, hidden_dim] = [10240, 2560]
+    torch::Tensor mlp_up_bias,       // [ffn_dim]
+    torch::Tensor mlp_down_weight,   // [hidden_dim, ffn_dim] = [2560, 10240]
+    torch::Tensor mlp_down_bias,     // [hidden_dim]
+    int64_t current_seq_len          // Current sequence length (before appending new token)
 ) 
 {
     cudaFuncSetAttribute(PythiaDecoderLayerKernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    // Increase shmem size to accommodate FFN_DIM_PER_CLUSTER for MLP up output
     uint32_t max_shmem_size = 128 * sizeof(char) + (2 * TMA_LOAD_ONCE * MAX_SMEM_DIM + DIM_PER_BLOCK + 3 * HEAD_DIM) * sizeof(half) + DIM_BLOCK_REDUCE * sizeof(float);
     cudaFuncSetAttribute(PythiaDecoderLayerKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem_size);
     
@@ -24,6 +32,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     torch::Tensor o = torch::full({1, HIDDEN_DIM}, 0, options);
     torch::Tensor k = torch::full({1, HEAD_NUM, HEAD_DIM}, 0, options);
     torch::Tensor v = torch::full({1, HEAD_NUM, HEAD_DIM}, 0, options);
+    
+    // Intermediate buffer for MLP up projection output
+    torch::Tensor mlp_intermediate = torch::empty({FFN_DIM}, options);
+    // Buffer for post-attention LayerNorm output (input to MLP)
+    torch::Tensor post_ln_buffer = torch::empty({HIDDEN_DIM}, options);
     
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
     half* k_ptr = reinterpret_cast<half*>(k.data_ptr<at::Half>());
@@ -40,6 +53,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     half* layernorm_bias_ptr = reinterpret_cast<half*>(layernorm_bias.data_ptr<at::Half>());
     float* cos_ptr = reinterpret_cast<float*>(cos.data_ptr<float>());
     float* sin_ptr = reinterpret_cast<float*>(sin.data_ptr<float>());
+    
+    // MLP pointers
+    half* post_ln_weight_ptr = reinterpret_cast<half*>(post_ln_weight.data_ptr<at::Half>());
+    half* post_ln_bias_ptr = reinterpret_cast<half*>(post_ln_bias.data_ptr<at::Half>());
+    half* mlp_up_weight_ptr = reinterpret_cast<half*>(mlp_up_weight.data_ptr<at::Half>());
+    half* mlp_up_bias_ptr = reinterpret_cast<half*>(mlp_up_bias.data_ptr<at::Half>());
+    half* mlp_down_weight_ptr = reinterpret_cast<half*>(mlp_down_weight.data_ptr<at::Half>());
+    half* mlp_down_bias_ptr = reinterpret_cast<half*>(mlp_down_bias.data_ptr<at::Half>());
+    half* mlp_intermediate_ptr = reinterpret_cast<half*>(mlp_intermediate.data_ptr<at::Half>());
+    half* post_ln_buffer_ptr = reinterpret_cast<half*>(post_ln_buffer.data_ptr<at::Half>());
 
     // SEQ_LEN is the current cache length (before appending new token)
     // Kernel will read cache[0:SEQ_LEN] and write to cache[SEQ_LEN]
@@ -146,30 +169,82 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 
+    // MLP up weight tensor map
+    // mlp_up_weight shape: [ffn_dim=10240, hidden_dim=2560]
+    // TMA: size = {in_dim=hidden, out_dim=ffn}, box = {TMA_LOAD_ONCE, HEAD_DIM}
+    // Each block loads HEAD_DIM (80) output dims (same pattern as QKV projection)
+    CUtensorMap tensor_map_mlp_up{};
+    uint64_t size_mlp_up[rank] = {HIDDEN_DIM, FFN_DIM};
+    uint64_t stride_mlp_up[rank - 1] = {HIDDEN_DIM * sizeof(half)};
+    uint32_t box_size_mlp_up[rank] = {TMA_LOAD_ONCE, HEAD_DIM};  // Same as QKV
+    uint32_t elem_stride_mlp_up[rank] = {1, 1};
+    
+    CUresult res_mlp_up = cuTensorMapEncodeTiled(
+        &tensor_map_mlp_up,                
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+        rank,                       
+        mlp_up_weight_ptr,                 
+        size_mlp_up,                       
+        stride_mlp_up,                     
+        box_size_mlp_up,                   
+        elem_stride_mlp_up,                
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
+    // MLP down weight tensor map
+    // mlp_down_weight shape: [hidden_dim=2560, ffn_dim=10240]
+    // TMA: size = {in_dim=ffn, out_dim=hidden}, box = {TMA_LOAD_ONCE, HEAD_DIM}
+    // Each cluster loads HEAD_DIM (80) output dims
+    CUtensorMap tensor_map_mlp_down{};
+    uint64_t size_mlp_down[rank] = {FFN_DIM, HIDDEN_DIM};
+    uint64_t stride_mlp_down[rank - 1] = {FFN_DIM * sizeof(half)};
+    uint32_t box_size_mlp_down[rank] = {TMA_LOAD_ONCE, HEAD_DIM};
+    uint32_t elem_stride_mlp_down[rank] = {1, 1};
+    
+    CUresult res_mlp_down = cuTensorMapEncodeTiled(
+        &tensor_map_mlp_down,                
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+        rank,                       
+        mlp_down_weight_ptr,                 
+        size_mlp_down,                       
+        stride_mlp_down,                     
+        box_size_mlp_down,                   
+        elem_stride_mlp_down,                
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
     dim3 grid(HEAD_NUM * CLUSTER_SIZE); 
     dim3 block(BLOCK_SIZE);
 
     cudaDeviceSynchronize();
-    PythiaDecoderLayerKernel<<<grid, block, max_shmem_size>>>(
-        o_ptr,
-        k_ptr,
-        v_ptr,
-        input_ptr,
-        layernorm_weight_ptr,
-        layernorm_bias_ptr,
-        bias_qkv_ptr,
-        bias_o_ptr,
-        cos_ptr,
-        sin_ptr,
-        k_cache_ptr,
-        v_cache_ptr,
-        tensor_map_weight,
-        tensor_map_k_cache,
-        tensor_map_v_cache,
-        tensor_map_weight_o,
-        seq_len,
-        KV_DIM_PER_BLOCK
+    
+    // Use cooperative launch for grid.sync() support
+    void* kernel_args[] = {
+        &o_ptr, &k_ptr, &v_ptr, &input_ptr,
+        &layernorm_weight_ptr, &layernorm_bias_ptr, &bias_qkv_ptr, &bias_o_ptr,
+        &cos_ptr, &sin_ptr, &k_cache_ptr, &v_cache_ptr,
+        &post_ln_weight_ptr, &post_ln_bias_ptr,
+        &mlp_up_weight_ptr, &mlp_up_bias_ptr, &mlp_down_weight_ptr, &mlp_down_bias_ptr,
+        &mlp_intermediate_ptr, &post_ln_buffer_ptr,
+        (void*)&tensor_map_weight, (void*)&tensor_map_k_cache, 
+        (void*)&tensor_map_v_cache, (void*)&tensor_map_weight_o,
+        (void*)&tensor_map_mlp_up, (void*)&tensor_map_mlp_down,
+        (void*)&seq_len, (void*)&KV_DIM_PER_BLOCK
+    };
+    
+    cudaLaunchCooperativeKernel(
+        (void*)PythiaDecoderLayerKernel,
+        grid, block,
+        kernel_args,
+        max_shmem_size
     );
+    
     cudaDeviceSynchronize();
     return std::make_tuple(o, k, v);
 }
