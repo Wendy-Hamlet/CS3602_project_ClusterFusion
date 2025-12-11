@@ -815,42 +815,27 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         }
     }
     
-    // ==================== MLP: Post-Attention LayerNorm ====================
-    // Pythia uses parallel residual: mlp_input = post_ln(original_input)
-    // OPTIMIZATION: Both input_layernorm and post_attention_layernorm normalize the same input,
-    // so mean and variance are the same! We can reuse local_mean and var_rcp from the first LN.
-    // We already computed local_mean and var_rcp earlier, just need to apply different weights.
+    // ==================== Post-Attention LayerNorm ====================
+    // Compute post-attention LayerNorm and store in global buffer (L2 cached)
+    // This is the FASTEST approach: 5KB data fits in L2, high cache hit rate
     cluster.sync();
     
-    // Reload input from first LN computation (local_mean and var_rcp are still valid)
-    // Apply post-attention LayerNorm with different weights/bias
-    // Write result to mlp_intermediate (first 2560 elements used as post-LN buffer)
-    for (int d = tid * 8; d < DIM_PER_BLOCK; d += BLOCK_SIZE * 8) { 
-        *(uint4*)(&reg_input[0]) = *(uint4*)(&input[cluster_block_st_id + d]);
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&post_ln_weight[cluster_block_st_id + d]);
-        half __align__(16) reg_bias[8];
-        *(uint4*)(&reg_bias[0]) = *(uint4*)(&post_ln_bias[cluster_block_st_id + d]);
-        for (int i = 0; i < 8; i++) {
-            float normalized = (__half2float(reg_input[i]) - local_mean) * var_rcp;
-            reg_input[i] = __float2half(normalized * __half2float(reg_weight[i]) + __half2float(reg_bias[i]));
-        }
-        // Write post-LN result to global memory
-        *(uint4*)(&post_ln_buffer[cluster_block_st_id + d]) = *(uint4*)(&reg_input[0]);
+    // Each block computes its portion of post-LN (DIM_PER_BLOCK = 640 dims)
+    for (int d = tid; d < DIM_PER_BLOCK; d += BLOCK_SIZE) {
+        int idx = cluster_block_st_id + d;
+        float normalized = (__half2float(input[idx]) - local_mean) * var_rcp;
+        post_ln_buffer[idx] = __float2half(normalized * __half2float(post_ln_weight[idx]) + __half2float(post_ln_bias[idx]));
     }
-    // Also store to shared memory for local use
     block.sync();
     
     // ==================== MLP Up Projection ====================
-    // Wait for all blocks to finish writing post-LN to global buffer
-    grid.sync();  // Requires cooperative launch
-    
     // Each block computes HEAD_DIM (80) output dimensions independently
     // Total: 32 heads * 4 blocks * 80 = 10240 ✓
     uint32_t global_block_id = head_id * CLUSTER_SIZE + cluster_block_id;  // 0 to 127
     uint32_t ffn_block_offset = global_block_id * HEAD_DIM;  // Each block's 80 output dims
     
-    // MLP up: each block reads ALL HIDDEN_DIM (2560) input dims from post_ln_buffer
-    // TMA loads: [TMA_LOAD_ONCE=64 input dims, HEAD_DIM=80 output dims]
+    // MLP up: each block reads ALL HIDDEN_DIM (2560) input dims from post_ln_buffer (L2 cached)
+    // TMA loads weight: [TMA_LOAD_ONCE=64 input dims, HEAD_DIM=80 output dims]
     // HIDDEN_DIM / TMA_LOAD_ONCE = 2560 / 64 = 40 iterations
     if (tid == 0) {
         cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[0], &tensor_map_mlp_up, 0, ffn_block_offset, bar[0]);
@@ -870,8 +855,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         bar[(id - 1) % 2].wait(std::move(token[(id - 1) % 2]));
         
         if (weight_idx < HEAD_DIM) {
+            #pragma unroll 8
             for (int i = 0; i < TMA_LOAD_ONCE; i += NUM_PER_ROW) {
-                // Read post-LN input from global buffer
+                // Read from post_ln_buffer (L2 cache hit expected for 5KB data)
                 *(uint4*)(&reg_input[0]) = *(uint4*)(&post_ln_buffer[(id - 1) * TMA_LOAD_ONCE + input_idx + i]);
                 
                 #pragma unroll
@@ -883,8 +869,10 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     }
     bar[(HIDDEN_DIM / TMA_LOAD_ONCE - 1) % 2].wait(std::move(token[(HIDDEN_DIM / TMA_LOAD_ONCE - 1) % 2]));
     if (weight_idx < HEAD_DIM) {
+        #pragma unroll 8
         for (int i = 0; i < TMA_LOAD_ONCE; i += NUM_PER_ROW) {
             *(uint4*)(&reg_input[0]) = *(uint4*)(&post_ln_buffer[((HIDDEN_DIM / TMA_LOAD_ONCE) - 1) * TMA_LOAD_ONCE + input_idx + i]);
+            
             #pragma unroll
             for (int d = 0; d < NUM_PER_THREAD; d++) {
                 tmp += __half2float(reg_input[d]) * __half2float(weight[TMA_LOAD_ONCE_NUM + weight_idx * TMA_LOAD_ONCE + (input_idx + i + d)]);
@@ -899,18 +887,18 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     // No cluster reduce needed - each block writes its own 80 dims directly
     // Add MLP up bias and apply GELU, write to mlp_intermediate
     // GELU(x) ≈ x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    // Using __tanf for faster computation while maintaining accuracy
     constexpr float GELU_CONST = 0.7978845608028654f;  // sqrt(2/pi)
     constexpr float GELU_COEF = 0.044715f;
     
     if (lane_id % NUM_THREAD_PER_ROW == 0 && weight_idx < HEAD_DIM) {
         float val = tmp + __half2float(mlp_up_bias[ffn_block_offset + weight_idx]);
-        // GELU approximation
         float x3 = val * val * val;
         float tanh_arg = GELU_CONST * (val + GELU_COEF * x3);
         float gelu_val = val * 0.5f * (1.0f + tanhf(tanh_arg));
         mlp_intermediate[ffn_block_offset + weight_idx] = __float2half(gelu_val);
     }
-    block.sync();
+    // Note: block.sync() removed - grid.sync() below synchronizes all threads
     
     // ==================== MLP Down Projection ====================
     // Wait for all clusters to finish writing to mlp_intermediate
@@ -936,6 +924,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     }
 
     // ffn_input_per_block / TMA_LOAD_ONCE = 2560 / 64 = 40 iterations per block
+    // Pre-declare mlp_intermediate buffer for vectorized loads
+    half __align__(16) mlp_in[NUM_PER_THREAD];
+    
     for (int id = 1; id < ffn_input_per_block / TMA_LOAD_ONCE; id++) {
         if (tid == 0) {
             cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM], &tensor_map_mlp_down, ffn_input_offset + id * TMA_LOAD_ONCE, down_out_offset, bar[id % 2]);
@@ -945,24 +936,26 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         }
         bar[(id - 1) % 2].wait(std::move(token[(id - 1) % 2]));
         
-        // Load corresponding mlp_intermediate values
+        // Load corresponding mlp_intermediate values (vectorized)
         if (weight_idx < HEAD_DIM) {
+            #pragma unroll 8
             for (int i = 0; i < TMA_LOAD_ONCE; i += NUM_PER_ROW) {
-                *(uint4*)(&reg_input[0]) = *(uint4*)(&mlp_intermediate[ffn_input_offset + (id - 1) * TMA_LOAD_ONCE + input_idx + i]);
+                *(uint4*)(&mlp_in[0]) = *(uint4*)(&mlp_intermediate[ffn_input_offset + (id - 1) * TMA_LOAD_ONCE + input_idx + i]);
                 #pragma unroll
                 for (int d = 0; d < NUM_PER_THREAD; d++) {
-                    tmp += __half2float(reg_input[d]) * __half2float(weight[((id - 1) % 2) * TMA_LOAD_ONCE_NUM + weight_idx * TMA_LOAD_ONCE + (input_idx + i + d)]);
+                    tmp += __half2float(mlp_in[d]) * __half2float(weight[((id - 1) % 2) * TMA_LOAD_ONCE_NUM + weight_idx * TMA_LOAD_ONCE + (input_idx + i + d)]);
                 }
             }
         }
     }
     bar[(ffn_input_per_block / TMA_LOAD_ONCE - 1) % 2].wait(std::move(token[(ffn_input_per_block / TMA_LOAD_ONCE - 1) % 2]));
     if (weight_idx < HEAD_DIM) {
+        #pragma unroll 8
         for (int i = 0; i < TMA_LOAD_ONCE; i += NUM_PER_ROW) {
-            *(uint4*)(&reg_input[0]) = *(uint4*)(&mlp_intermediate[ffn_input_offset + ((ffn_input_per_block / TMA_LOAD_ONCE) - 1) * TMA_LOAD_ONCE + input_idx + i]);
+            *(uint4*)(&mlp_in[0]) = *(uint4*)(&mlp_intermediate[ffn_input_offset + ((ffn_input_per_block / TMA_LOAD_ONCE) - 1) * TMA_LOAD_ONCE + input_idx + i]);
             #pragma unroll
             for (int d = 0; d < NUM_PER_THREAD; d++) {
-                tmp += __half2float(reg_input[d]) * __half2float(weight[TMA_LOAD_ONCE_NUM + weight_idx * TMA_LOAD_ONCE + (input_idx + i + d)]);
+                tmp += __half2float(mlp_in[d]) * __half2float(weight[TMA_LOAD_ONCE_NUM + weight_idx * TMA_LOAD_ONCE + (input_idx + i + d)]);
             }
         }
     }

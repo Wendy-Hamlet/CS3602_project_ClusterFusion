@@ -24,7 +24,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
 ) 
 {
     cudaFuncSetAttribute(PythiaDecoderLayerKernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    // Increase shmem size to accommodate FFN_DIM_PER_CLUSTER for MLP up output
+    // Shared memory layout: weight(2*TMA*MAX) + local_qkv(3*HEAD) + input_shmem(DIM_PER_BLOCK) + reduction
+    // ~23KB total, well within 96KB limit
     uint32_t max_shmem_size = 128 * sizeof(char) + (2 * TMA_LOAD_ONCE * MAX_SMEM_DIM + DIM_PER_BLOCK + 3 * HEAD_DIM) * sizeof(half) + DIM_BLOCK_REDUCE * sizeof(float);
     cudaFuncSetAttribute(PythiaDecoderLayerKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem_size);
     

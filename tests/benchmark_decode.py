@@ -164,18 +164,33 @@ def decode_clusterfusion(model, prompt, num_new_tokens, state):
 
 
 def decode_hf(model, input_ids, num_new_tokens):
+    """
+    HuggingFace decode-only timing.
+    First do prefill OUTSIDE timing, then measure only decode phase.
+    """
+    # Prefill outside timing
+    with torch.no_grad():
+        outputs = model(input_ids, use_cache=True)
+        past_key_values = outputs.past_key_values
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+    
+    generated_ids = input_ids[0].tolist() + [next_token.item()]
+    
+    # Decode-only timing
     torch.cuda.synchronize()
     start = time.time()
     with torch.no_grad():
-        output_ids = model.generate(
-            input_ids,
-            max_new_tokens=num_new_tokens,
-            do_sample=False,
-            use_cache=True,
-        )
+        for _ in range(num_new_tokens - 1):
+            outputs = model(next_token, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            generated_ids.append(next_token.item())
+    
     torch.cuda.synchronize()
     decode_time = time.time() - start
-    return decode_time, output_ids[0].tolist()
+    return decode_time, generated_ids
 
 
 def main():
@@ -189,27 +204,27 @@ def main():
     results = []
     for num_tokens in TOKEN_COUNTS:
         state = prepare_setup(model, tokenizer, PROMPT, num_tokens)
-        cluster_time, ids_kernel = decode_clusterfusion(model, PROMPT, num_tokens, state)
+        cf_time, ids_kernel = decode_clusterfusion(model, PROMPT, num_tokens, state)
         hf_time, ids_hf = decode_hf(model, state["input_ids"], num_tokens)
 
         results.append(
             {
                 "tokens": num_tokens,
-                "cf_decode_s": cluster_time,
+                "cf_decode_s": cf_time,
                 "hf_decode_s": hf_time,
-                "speedup": hf_time / cluster_time if cluster_time > 0 else float("inf"),
+                "speedup_cf": hf_time / cf_time if cf_time > 0 else float("inf"),
                 "match": ids_hf == (state["input_ids"][0].tolist() + ids_kernel),
                 "setup_s": state["setup_time"],
             }
         )
 
     print("\n=== Decode Time (excluding setup) ===")
-    header = f"{'tokens':>8} | {'CF_decode(s)':>12} | {'HF_decode(s)':>12} | {'speedup':>8} | {'match':>6} | {'setup_excl?':>12}"
+    header = f"{'tokens':>8} | {'CF_fused(s)':>12} | {'HF(s)':>8} | {'spd_fused':>9} | {'match':>6} | {'setup':>8}"
     print(header)
     print("-" * len(header))
     for r in results:
         print(
-            f"{r['tokens']:8d} | {r['cf_decode_s']:12.3f} | {r['hf_decode_s']:12.3f} | {r['speedup']:8.2f} | {str(r['match']):>6} | {'excluded':>12}"
+            f"{r['tokens']:8d} | {r['cf_decode_s']:12.3f} | {r['hf_decode_s']:8.3f} | {r['speedup_cf']:9.2f} | {str(r['match']):>6} | {r['setup_s']:8.3f}"
         )
 
 

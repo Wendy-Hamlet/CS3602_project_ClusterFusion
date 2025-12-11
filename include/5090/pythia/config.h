@@ -34,7 +34,10 @@
 
 #define DIM_PER_BLOCK (HIDDEN_DIM / CLUSTER_SIZE)  // 640
 #define FFN_DIM_PER_CLUSTER (FFN_DIM / HEAD_NUM)   // 320
-#define MAX_SMEM_DIM FFN_DIM_PER_CLUSTER           // 320
+
+// Shared memory sizing: TMA loads TMA_LOAD_ONCE x HEAD_DIM tiles
+// MAX_SMEM_DIM should be HEAD_DIM for weight buffer
+#define MAX_SMEM_DIM HEAD_DIM                      // 80 (optimized from 320)
 
 // TMA configuration for QKV weights
 // Load TMA_LOAD_ONCE rows of input dimension, HEAD_DIM columns of output dimension
