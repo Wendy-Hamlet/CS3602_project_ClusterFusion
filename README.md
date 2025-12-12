@@ -19,6 +19,7 @@ Key architectural/kernel differences:
 - Norm and residual: Pythia uses LayerNorm with bias and parallel residual (attention + MLP). The kernel keeps RMSNorm-style math for simplicity while leaving the final LayerNorm in PyTorch.
 - Projections: QKV weights are interleaved with bias; MLP branch (GELU approx) is fused alongside attention.
 - Scope: sglang batching removed; only `sm_120` kernels are wired up.
+- CUDA Graph Context: TensorMaps created once per layer with `max_seq_len`, eliminating per-step TensorMap reconstruction overhead.
 
 ## Environment
 - Python 3.13 (conda), NVIDIA GPU with `sm_120` compute capability
@@ -58,18 +59,27 @@ python tests/benchmark_decode.py
 Command used (with mirror):  
 `conda activate nlp_project && export HF_ENDPOINT=https://hf-mirror.com && python tests/benchmark_decode.py`
 
-Decode-only timings (setup excluded):
+Decode-only timings (setup excluded, with warmup):
+- **CF**: Standard ClusterFusion kernel dispatch
+- **CF_ctx**: CUDA Graph context optimization (TensorMaps created once, static buffers reused)
+
 ```
-tokens | CF_fused(s) | HF(s) | speedup_cf | match | setup(s)
-   16  |      0.126  | 0.089 |     0.70   | True  | 0.214
-   32  |      0.167  | 0.177 |     1.06   | True  | 0.007
-   64  |      0.342  | 0.359 |     1.05   | True  | 0.007
-  128  |      0.684  | 0.733 |     1.07   | True  | 0.007
-  256  |      1.387  | 1.487 |     1.07   | True  | 0.007
-  512  |      2.803  | 3.055 |     1.09   | True  | 0.007
- 1024  |      5.638  | 6.398 |     1.13   | True  | 0.008
- 2048  |     11.592  |13.568 |     1.17   | True  | 0.010
+tokens | CF(s) | CF_ctx(s) | HF(s) | spd_CF | spd_ctx | match
+   16  | 0.076 |    0.071  | 0.086 |  1.12  |  1.20   | True
+   32  | 0.158 |    0.147  | 0.177 |  1.12  |  1.20   | True
+   64  | 0.322 |    0.299  | 0.359 |  1.11  |  1.20   | True
+  128  | 0.648 |    0.604  | 0.730 |  1.13  |  1.21   | True
+  256  | 1.314 |    1.220  | 1.494 |  1.14  |  1.22   | True
+  512  | 2.653 |    2.464  | 3.048 |  1.15  |  1.24   | True
+ 1024  | 5.348 |    4.990  | 6.371 |  1.19  |  1.28   | True
+ 2048  |10.925 |   10.171  |13.509 |  1.24  |  1.33   | True
 ```
+
+**Key optimizations:**
+- Single-pass LayerNorm (Var(x) = E[x²] - E[x]²)
+- Tree reduction for cluster-level reductions (log2(4)=2 steps vs 3 sequential)
+- PTX-accelerated GELU (using `ptx_exp2` and `ptx_tanh`)
+- CUDA Graph context: TensorMaps created once with `max_seq_len`, static buffers reused (7% additional speedup over standard CF)
 
 ## Citation
 
