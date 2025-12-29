@@ -81,9 +81,9 @@ def pytorch_attention_mlp_up(hidden, layer, k_cache, v_cache, cos, sin, seq_len)
     
     q = q.squeeze(0).squeeze(0)  # [NUM_HEADS, HEAD_DIM]
     
-    attn_scores = torch.einsum('hd,shd->hs', q, k_cached) / (HEAD_DIM ** 0.5)
-    attn_probs = F.softmax(attn_scores, dim=-1)
-    attn_out = torch.einsum('hs,shd->hd', attn_probs, v_cached)
+    attn_scores = torch.einsum('hd,shd->hs', q.float(), k_cached.float()) / (HEAD_DIM ** 0.5)
+    attn_probs = F.softmax(attn_scores, dim=-1).half()
+    attn_out = torch.einsum('hs,shd->hd', attn_probs.float(), v_cached.float()).half()
     attn_out = attn_out.view(1, HIDDEN_DIM)
     
     # Output projection
