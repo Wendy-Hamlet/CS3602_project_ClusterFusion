@@ -25,16 +25,29 @@ The following operations are fused into a single CUDA kernel:
 
 ## Performance Results
 
-Benchmarked on NVIDIA RTX 5090 (sm_120), batch=1, seq_len=64:
+Benchmarked on NVIDIA RTX 5090 (sm_120), batch=1:
 
-### Per-Layer Benchmark (vs PyTorch Baseline)
+### End-to-End Benchmark (vs PyTorch Baseline)
 
-| Metric | PyTorch | ClusterFusion | Speedup |
-|--------|---------|---------------|---------|
-| Attention + MLP Up + GELU | 0.27 ms | 0.14 ms | **1.88x** |
-| 32 layers total | 8.69 ms | 4.61 ms | **1.88x** |
+| Tokens | CF(s) | PyTorch(s) | Speedup | TPOT CF(ms) | TPOT PT(ms) |
+|--------|-------|------------|---------|-------------|-------------|
+| 16 | 0.078 | 0.100 | **1.27x** | 5.23 | 6.64 |
+| 32 | 0.163 | 0.209 | **1.28x** | 5.25 | 6.74 |
+| 64 | 0.333 | 0.420 | **1.26x** | 5.29 | 6.66 |
+| 128 | 0.668 | 0.845 | **1.26x** | 5.26 | 6.65 |
+| 256 | 1.349 | 1.701 | **1.26x** | 5.29 | 6.67 |
+| 512 | 2.724 | 3.463 | **1.27x** | 5.33 | 6.78 |
+| 1024 | 5.518 | 7.125 | **1.29x** | 5.39 | 6.96 |
+| 2048 | 11.249 | 14.950 | **1.33x** | 5.50 | 7.30 |
 
-The baseline is a pure PyTorch implementation of the same operations (LayerNorm, QKV, RoPE, Attention, Output, PostLN, MLP Up, GELU).
+| Summary | Value |
+|---------|-------|
+| Average Speedup | **1.28x** |
+| Max Speedup | **1.33x** |
+| Average TPOT (CF) | 5.32 ms |
+| Average TPOT (PT) | 6.80 ms |
+
+The baseline is a pure PyTorch implementation of the same operations (LayerNorm, QKV, RoPE, Attention, Output, PostLN, MLP Up, GELU, then PyTorch MLP Down).
 
 ### Why This Kernel is Fast
 
@@ -119,7 +132,8 @@ output = hidden_states + attn_output + mlp_output  # Parallel residual
 |------|-------------|
 | `include/5090/pythia_2b8/kernel_attention.cuh` | CUDA kernel implementation |
 | `include/5090/pythia_2b8/pythia_attention_dispatch.cu` | Kernel dispatch |
-| `tests/test_attention_only.py` | Test and benchmark |
+| `tests/test_attention_only.py` | Correctness test and per-layer benchmark |
+| `tests/benchmark_e2e.py` | End-to-end TPOT benchmark |
 
 ## Requirements
 
