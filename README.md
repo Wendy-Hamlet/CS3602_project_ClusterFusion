@@ -34,9 +34,13 @@ Benchmarked on NVIDIA RTX 5090 (sm_120), batch=1, seq_len=64:
 | Time per layer | 0.27 ms | 0.14 ms | **1.88x** |
 | 32 layers total | 8.69 ms | 4.61 ms | **1.88x** |
 
-### Contribution to Full Decoder
+### Why This Kernel is Fast
 
-Based on our ablation study, this kernel contributes **77%** of the total speedup when used in the fused decoder layer (1.33x total speedup with Graph mode).
+The 1.88x speedup comes from fusing multiple operations:
+- **7 operations fused**: LayerNorm → QKV → RoPE → Attention → Output → PostLN → MLP Up → GELU
+- **Single kernel launch**: Eliminates 6+ kernel launch overheads
+- **Register/shared memory reuse**: Intermediate data stays on-chip
+- **TMA acceleration**: Hardware-accelerated weight loading
 
 ## Environment
 
