@@ -27,10 +27,16 @@ The following operations are fused into a single CUDA kernel:
 
 Benchmarked on NVIDIA RTX 5090 (sm_120), batch=1, seq_len=64:
 
+### Per-Layer Benchmark (Attention + MLP Up + GELU)
+
 | Metric | PyTorch | ClusterFusion | Speedup |
 |--------|---------|---------------|---------|
-| Time per layer | 0.27 ms | 0.15 ms | **1.8x** |
-| 32 layers total | 8.84 ms | 4.63 ms | **1.91x** |
+| Time per layer | 0.27 ms | 0.14 ms | **1.88x** |
+| 32 layers total | 8.69 ms | 4.61 ms | **1.88x** |
+
+### Contribution to Full Decoder
+
+Based on our ablation study, this kernel contributes **77%** of the total speedup when used in the fused decoder layer (1.33x total speedup with Graph mode).
 
 ## Environment
 
