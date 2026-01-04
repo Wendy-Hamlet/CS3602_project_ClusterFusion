@@ -25,22 +25,16 @@ The following operations are fused into a single CUDA kernel:
 
 ## Performance Results
 
-Benchmarked on NVIDIA RTX 5090 (sm_120), batch=1, decode phase only (excluding prefill):
+Benchmarked on NVIDIA RTX 5090 (sm_120), batch=1, seq_len=64:
 
-### End-to-End Decode Benchmark
+### Per-Layer Benchmark (vs PyTorch Baseline)
 
-| Tokens | CUDA Attn+Up (s) | HuggingFace (s) | Speedup |
-|--------|------------------|-----------------|---------|
-| 16 | 0.079 | 0.085 | 1.08x |
-| 32 | 0.164 | 0.177 | 1.08x |
-| 64 | 0.332 | 0.359 | 1.08x |
-| 128 | 0.672 | 0.733 | 1.09x |
-| 256 | 1.353 | 1.482 | 1.10x |
-| 512 | 2.730 | 3.053 | 1.12x |
-| 1024 | 5.528 | 6.357 | 1.15x |
-| 2048 | 11.253 | 13.530 | **1.20x** |
+| Metric | PyTorch | ClusterFusion | Speedup |
+|--------|---------|---------------|---------|
+| Attention + MLP Up + GELU | 0.27 ms | 0.14 ms | **1.88x** |
+| 32 layers total | 8.69 ms | 4.61 ms | **1.88x** |
 
-**Average speedup: 1.11x** | **Max speedup: 1.20x**
+The baseline is a pure PyTorch implementation of the same operations (LayerNorm, QKV, RoPE, Attention, Output, PostLN, MLP Up, GELU).
 
 ### Why This Kernel is Fast
 
