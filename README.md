@@ -143,14 +143,12 @@ output = hidden_states + attn_output + mlp_output  # Parallel residual
 - CUDA 12.8+
 - flashinfer-python
 
-## Citation
+## Acknowledgments
 
-```bibtex
-@misc{luo2025clusterfusion,
-      title={ClusterFusion: Expanding Operator Fusion Scope for LLM Inference},
-      author={Xinhao Luo et al.},
-      year={2025},
-      eprint={2508.18850},
-      archivePrefix={arXiv}
-}
-```
+This implementation is inspired by the ClusterFusion framework, which introduces cluster-level operator fusion for LLM inference on NVIDIA Blackwell GPUs. For more details, please refer to:
+
+**ClusterFusion: Expanding Operator Fusion Scope for LLM Inference**  
+Xinhao Luo et al., 2025  
+arXiv: [2508.18850](https://arxiv.org/abs/2508.18850)
+
+We extend their work by focusing specifically on the Attention + MLP Up computation path for Pythia-2.8B, demonstrating the performance benefits of kernel fusion on decode-time inference.
